@@ -1,67 +1,158 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+import os
 from dotenv import load_dotenv
-from langchain_core.documents import Document
-from langchain_text_splitters import  RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_google_genai import ChatGoogleGenerativeAI
+from jose import jwt
+from datetime import datetime, timedelta
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from langchain_postgres import PGVector
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings,
+    ChatGoogleGenerativeAI
+)
 
 load_dotenv()
 
-loader = PyPDFLoader("cv.pdf")
+security = HTTPBearer()
 
-documents = loader.load()
 
-# Split into chunks
-text_splitter =  RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
+
+
+
+CONNECTION = os.getenv("DATABASE_URL")
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM")
+
+fake_users = {
+    "ayush": {
+        "username": "ayush",
+        "password": "1234"
+    }
+}
+
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="gemini-embedding-001"
 )
-
-docs = text_splitter.split_documents(documents)
-
-for i, doc in enumerate(docs):
-    print(f"\nChunk {i+1}:\n")
-    print(doc.page_content)
-    print("=" * 50)
-# Create embedding model 
-embeddings = GoogleGenerativeAIEmbeddings( 
-    model="gemini-embedding-001" )
-
-# Store in vector DB
-vectorstore = Chroma.from_documents(
-    documents=docs,
-    embedding=embeddings,
-    persist_directory="./chroma_db"
+vectorstore = PGVector(
+    embeddings=embeddings,
+    connection=CONNECTION,
+    collection_name="rag_collection"
 )
 
 retriever = vectorstore.as_retriever(
-    search_kwargs={"k": 1}
+    search_kwargs={"k": 3}
 )
-
-query = "What is occupation of ayush " 
-
-retrieved_docs = retriever.invoke(query)
-context = "\n".join([
-    doc.page_content for doc in retrieved_docs
-])
-
-prompt = f"""
-Answer the question using the context below.
-
-Context:
-{context}
-
-Question:
-{query}
-"""
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash"
 )
 
-response = llm.invoke(prompt)
 
-print("\nFinal Answer:\n")
-print(response.content)
+app = FastAPI()
 
+class QueryRequest(BaseModel):
+
+    question: str
+
+class LoginRequest(BaseModel):
+
+    username: str
+    password: str
+
+
+def create_access_token(data: dict):
+
+    to_encode = data.copy()
+
+    expire = datetime.utcnow() + timedelta(hours=1)
+
+    to_encode.update({
+        "exp": expire
+    })
+
+    return jwt.encode(
+        to_encode,
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )    
+
+def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+
+    token = credentials.credentials
+
+    try:
+
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM]
+        )
+
+        return payload
+
+    except:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token"
+        )
+
+@app.post("/login")
+async def login(request: LoginRequest):
+
+    user = fake_users.get(
+        request.username
+    )
+
+    if not user:
+
+        return {
+            "error": "Invalid username"
+        }
+
+    if user["password"] != request.password:
+
+        return {
+            "error": "Invalid password"
+        }
+
+    token = create_access_token({
+        "sub": request.username
+    })
+
+    return {
+        "access_token": token
+    }
+
+
+@app.post("/ask")
+async def ask_question(request: QueryRequest , token: str = Depends(verify_token)):
+
+    docs = retriever.invoke(
+        request.question
+    )
+
+    context = "\n".join([
+        doc.page_content
+        for doc in docs
+    ])
+
+    prompt = f"""
+    Answer using the context below.
+
+    Context:
+    {context}
+
+    Question:
+    {request.question}
+    """
+
+    response = await llm.ainvoke(prompt)
+
+    return {
+        "answer": response.content
+    }
