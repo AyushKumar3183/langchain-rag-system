@@ -11,6 +11,9 @@ from langchain_google_genai import (
     GoogleGenerativeAIEmbeddings,
     ChatGoogleGenerativeAI
 )
+from fastapi import UploadFile, File, BackgroundTasks
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
@@ -156,3 +159,42 @@ async def ask_question(request: QueryRequest , token: str = Depends(verify_token
     return {
         "answer": response.content
     }
+
+def process_pdf(file_path: str):
+
+    loader = PyPDFLoader(file_path)
+
+    documents = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    split_docs = splitter.split_documents(
+        documents
+    )
+
+    PGVector.from_documents(
+        documents=split_docs,
+        embedding=embeddings,
+        connection=CONNECTION,
+        collection_name="rag_collection"
+    )
+
+    print(f"Indexed: {file_path}")
+
+@app.post("/upload-pdf")
+async def upload_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),token: str = Depends(verify_token)
+):
+
+    file_path = os.path.join("uploads", file.filename)
+
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    background_tasks.add_task(process_pdf, file_path)
+
+    return {"message": "File uploaded and will be processed in background"}
